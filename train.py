@@ -189,7 +189,7 @@ def train(hyp, opt, device, tb_writer=None):
     nl = model.model[-1].nl  # 檢測層的數量（用於縮放 hyp['obj']）
     imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # 驗證 imgsz 是否是 gs 的倍數
 
-    # 分佈式訓練（DDP）模式
+    # 分佈式訓練（DP）模式
     if cuda and rank == -1 and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
@@ -226,6 +226,43 @@ def train(hyp, opt, device, tb_writer=None):
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
             model.half().float()  # 預先減少錨點精度
+
+    # DDP 模式
+    # 如果使用 CUDA（GPU），並且 rank 不等於 -1（表示分布式訓練的一部分），
+    # 則創建 DDP 模型，用於多 GPU 並行訓練模型。
+    if cuda and rank != -1:
+        model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank,
+                    # 對於 DDP，nn.MultiheadAttention 不相容 https://github.com/pytorch/pytorch/issues/26698
+                    find_unused_parameters=any(isinstance(layer, nn.MultiheadAttention) for layer in model.modules()))
+
+    # 模型參數
+    # 這裡設置了一些模型的超參數，包括 box、cls、obj 等。
+    # 這些超參數會影響模型的訓練和性能。
+    hyp['box'] *= 3. / nl  # 規模化到層數
+    hyp['cls'] *= nc / 80. * 3. / nl  # 規模化到類別和層數
+    hyp['obj'] *= (imgsz / 640) ** 2 * 3. / nl  # 規模化到圖片大小和層數
+    hyp['label_smoothing'] = opt.label_smoothing
+    model.nc = nc  # 附加類別數到模型
+    model.hyp = hyp  # 附加超參數到模型
+    model.gr = 1.0  # iou 損失比例 (obj_loss = 1.0 或 iou)
+    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # 附加類別權重
+    model.names = names
+
+    # 開始訓練
+    t0 = time.time()
+    nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # 開始暖身迭代次數，最大(3個epoch，1k次迭代)
+    # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # 限制暖身訓練不超過總訓練次數的一半
+    maps = np.zeros(nc)  # 每個類別的 mAP
+    results = (0, 0, 0, 0, 0, 0, 0)  # P、R、mAP@0.5、mAP@0.5-0.95、val_loss(box, obj, cls)
+    scheduler.last_epoch = start_epoch - 1  # 不移動
+    scaler = amp.GradScaler(enabled=cuda)
+    compute_loss_ota = ComputeLossOTA(model)  # 初始化損失類別
+    compute_loss = ComputeLoss(model)  # 初始化損失類別
+    logger.info(f'圖像大小 {imgsz} 訓練，{imgsz_test} 測試\n'
+                f'使用 {dataloader.num_workers} 資料載入器工作程序\n'
+                f'記錄結果至 {save_dir}\n'
+                f'開始訓練 {epochs} 個epoch...')
+    torch.save(model, wdir / 'init.pt')
 
     for epoch in range(start_epoch, epochs):  # 迭代每個訓練週期（epoch）
 
