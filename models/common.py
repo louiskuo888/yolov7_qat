@@ -45,69 +45,65 @@ def dequantize(x, interval):
     x =  ((x+1)/2 + interval) 
     return x
 
-def wgt_DSQuant(b,kw=0.001,quant=True):
-    
-    def phi_function(x, mi, k): # g(x)
-        c = 1 / ((0.5*k).tanh())
-        x = c*(((x - mi)*k).tanh())##[-1,1]
-        return x    
-    def grad_function(input, k):
-        #interval = torch.div(input.abs(), 1, rounding_mode='floor')
+def wgt_DSQuant(b, kw=0.001, quant=True):
+    def phi_function(x, mi, k):  # 用於執行量化的函數
+        c = 1 / ((0.5 * k).tanh())
+        x = c * (((x - mi) * k).tanh())  # 量化函數
+        return x
+    def grad_function(input, k):  # 用於計算量化梯度的函數
         interval = input.abs().round()
         mi = (interval + 0.5)
-        c = 1 / ((0.5*k).tanh())
-        grad_tanh=((input.abs()-mi)*k).tanh()
-        c_tanh = c*(1-grad_tanh*grad_tanh)*k/2
+        c = 1 / ((0.5 * k).tanh())
+        grad_tanh = ((input.abs() - mi) * k).tanh()
+        c_tanh = c * (1 - grad_tanh * grad_tanh) * k / 2
         return c_tanh
-    def dequantize(x, interval):
-        # save mem
-        x =  ((x+1)/2 + interval) 
+    def dequantize(x, interval): # 用於反量化量化值的函數
+        x = ((x + 1) / 2 + interval)
         return x
     return _pq().apply
 
 class _pq(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, alpha):
-        b=8
-        quant=True
-        delta = 1/(2**b)
-        input=input.div(reshape_to_weight(alpha*delta))##q
-        clip=(2 ** b-1)
-        input_c = input.clamp(min=-clip, max=clip)##-7~7
+    def forward(ctx, input, alpha):  # DSQ的前向傳遞
+        b = 8
+        quant = True
+        delta = 1 / (2**b)
+        input = input.div(reshape_to_weight(alpha * delta))  # 進行量化操作
+        clip = (2 ** b - 1)
+        input_c = input.clamp(min=-clip, max=clip)  # 將量化值夾緊到範圍[-7, 7]
         sign = input_c.sign()
-        input_abs = input_c.abs() ##0~7
+        input_abs = input_c.abs()  # 取絕對值，範圍[0, 7]
+
         if quant:
-            # input_q = round_func(input_abs)
-            input_q = input_abs.round()
+            input_q = input_abs.round()  # 量化操作，四捨五入
         else:
             ktensor = torch.tensor([kw]).cuda()
             interval = input_abs.round()
             mi = (interval + 0.5)
-            input_q = phi_function(input_abs, mi, ktensor)##[0,7]
-            input_q = dequantize(input_q, interval) ##[0,7]            
-        input_q = input_q.mul(sign)##[-7,7]
+            input_q = phi_function(input_abs, mi, ktensor)  # 使用 phi_function 進行可微分的量化
+            input_q = dequantize(input_q, interval)  # 反量化操作
+
+        input_q = input_q.mul(sign)  # 將量化值與符號相乘，範圍[-7, 7]
         ctx.save_for_backward(input, input_q)
-        input_q = input_q.mul(reshape_to_weight(alpha)*delta)
+        input_q = input_q.mul(reshape_to_weight(alpha) * delta)  # 與 alpha 相關的縮放
+
         return input_q
 
     @staticmethod
-    def backward(ctx, grad_output):
-        b=8
-        clip=(2 ** b-1)
-        delta = 1/(2**b)
-        grad_input = grad_output.clone() # previous layer grad.
+    def backward(ctx, grad_output):  # DSQ的反向傳遞，包括 alpha 的梯度計算
+        b = 8
+        clip = (2 ** b - 1)
+        delta = 1 / (2**b)
+        grad_input = grad_output.clone()  # 上一層的梯度
         input, input_q = ctx.saved_tensors
-        i = (input.abs() > clip).float()#i = (input > 1.).float()
-        k_t=2**(2-b)
+        i = (input.abs() > clip).float()  # 創建指示超出範圍的指標
+        k_t = 2**(2-b)
         ktensor = torch.tensor([k_t]).float().cuda()
-        c_tanh = grad_function(input,ktensor)
+        c_tanh = grad_function(input, ktensor)  # 計算梯度的輔助函數
         sign = input.sign()
-        grad_alpha = (grad_output * delta*(clip*sign*i + (input_q - input) * (1 - i))).sum((1,2,3))
-        # print(grad_alpha.shape)
-        grad_input = grad_input*(1-i)*c_tanh
+        grad_alpha = (grad_output * delta * (clip * sign * i + (input_q - input) * (1 - i))).sum((1,2,3))
+        grad_input = grad_input * (1 - i) * c_tanh  # 考慮梯度和範圍外的值
         return grad_input, grad_alpha
-    
-    
     
 def act_DSQuant(b,ka=0.001,quant=True):
     
